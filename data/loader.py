@@ -1,7 +1,7 @@
 import json
 import pandas as pd
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Optional
 from .schema import Message
 
 
@@ -22,6 +22,19 @@ class DataLoader:
             data = json.load(f)
 
         messages = [Message.from_dict(item) for item in data]
+        self._cache[filename] = messages
+        return messages
+
+    def load_parquet(self, filename: str) -> list[Message]:
+        if filename in self._cache:
+            return self._cache[filename]
+
+        filepath = self.data_dir / filename
+        if not filepath.exists():
+            raise FileNotFoundError(f"Dataset not found: {filepath}")
+
+        df = pd.read_parquet(filepath)
+        messages = [Message.from_dict(row.to_dict()) for _, row in df.iterrows()]
         self._cache[filename] = messages
         return messages
 

@@ -107,18 +107,20 @@ LLM-NLP-attina/
 - [x] Crear `data/loader.py` con DataLoader para cargar datasets JSON
 - [x] Documentar la estructura del dataset (campos completos del esquema de Attina)
 
-### Fase 2: Desarrollo de los 3 MCP Services
+### Fase 2: Desarrollo de los 3 MCP Services ✅ COMPLETADA
 **Objetivo:** Construir 3 endpoints REST funcionales que procesen el dataset y devuelvan JSON.
 
-| Servicio | Endpoint | Descripción técnica |
-|---|---|---|
-| MCP Resumen | `POST /analisis/resumen` | Usa Gemini para síntesis de conversaciones. Prompt de few-shot para formato consistente. |
-| MCP Geográfico | `POST /analisis/geografico` | Procesa campo de ubicación, agrupa por zonas cardinales (Norte/Sur/Este/Oeste), calcula distribución porcentual. |
-| MCP Propagación | `POST /analisis/propagacion` | Recibe message_id, busca replies recursivamente, calcula alcance (directos + indirectos), velocidad media, profundidad. |
+| Servicio | Endpoint | Descripción técnica | Estado |
+|---|---|---|---|
+| MCP Resumen | `POST /analisis/resumen` | Usa Gemini para síntesis de conversaciones. Prompt de few-shot para formato consistente. | ✅ |
+| MCP Geográfico | `POST /analisis/geografico` | Procesa campo de ubicación, agrupa por zonas cardinales (Norte/Sur/Este/Oeste), calcula distribución porcentual. | ✅ |
+| MCP Propagación | `POST /analisis/propagacion` | Recibe message_id, busca replies recursivamente, calcula alcance (directos + indirectos), velocidad media, profundidad. | ✅ |
 
-**Verificación:** Cada endpoint debe responder correctamente con curl:
+**Verificación:** Cada endpoint responde correctamente con curl:
 ```bash
-curl -X POST http://localhost:8000/analisis/resumen -H "Content-Type: application/json" -d '{"dataset": [...]}
+curl -X POST http://localhost:8000/analisis/resumen -H "Content-Type: application/json" -d "{}"
+curl -X POST http://localhost:8000/analisis/geografico -H "Content-Type: application/json" -d "{}"
+curl -X POST http://localhost:8000/analisis/propagacion -H "Content-Type: application/json" -d "{\"message_id\": \"msg_001\"}"
 ```
 
 ### Fase 3: Construcción del Agente con LangGraph
