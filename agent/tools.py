@@ -72,10 +72,34 @@ def tool_propagacion(message_id: str) -> dict:
     return _post("/analisis/propagacion", {"message_id": message_id})
 
 
-TOOLS = [tool_resumen, tool_geografico, tool_propagacion]
+@tool
+def tool_semantico(query: str, n_results: int = 5, country: Optional[str] = None) -> dict:
+    """
+    Busca mensajes semánticamente similares a una consulta en lenguaje natural.
+    Usa embeddings vectoriales (ChromaDB) para encontrar mensajes relevantes
+    por significado, no por palabras exactas.
+    Úsala cuando el usuario quiera encontrar mensajes sobre un tema específico,
+    buscar opiniones similares, o explorar el dataset de forma semántica.
+
+    Args:
+        query:     Texto o pregunta en lenguaje natural para buscar.
+        n_results: Número de mensajes similares a devolver (default: 5).
+        country:   Filtrar resultados por país (opcional).
+
+    Returns:
+        Diccionario con lista de mensajes ordenados por similitud semántica.
+    """
+    payload: dict = {"query": query, "n_results": n_results}
+    if country:
+        payload["country"] = country
+    return _post("/analisis/semantico", payload)
+
+
+TOOLS = [tool_resumen, tool_geografico, tool_propagacion, tool_semantico]
 
 TOOLS_BY_INTENT = {
     "resumen": tool_resumen,
     "geografico": tool_geografico,
     "propagacion": tool_propagacion,
+    "semantico": tool_semantico,
 }

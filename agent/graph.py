@@ -2,6 +2,7 @@
 
 import re
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import Annotated, Optional, TypedDict
@@ -15,12 +16,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from services import config
 from agent.prompts import (
     FOLLOWUP_SYSTEM_PROMPT,
+    RAG_SYSTEM_PROMPT,
     RESPOND_FALLBACK_PROMPT,
     RESPOND_SYSTEM_PROMPT,
     ROUTER_HUMAN_PROMPT,
     ROUTER_SYSTEM_PROMPT,
 )
-from agent.tools import TOOLS_BY_INTENT, tool_geografico, tool_propagacion, tool_resumen
+from agent.tools import TOOLS_BY_INTENT, tool_geografico, tool_propagacion, tool_resumen, tool_semantico
+from rag.retriever import build_context_string, retrieve
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +129,7 @@ def node_router(state: AgentState) -> AgentState:
     response = llm.invoke(prompt)
     intencion = response.content.strip().lower().split()[0]
 
-    valid = {"resumen", "geografico", "propagacion", "seguimiento", "otro"}
+    valid = {"resumen", "geografico", "propagacion", "semantico", "seguimiento", "otro"}
     if intencion not in valid:
         intencion = "otro"
 
@@ -190,65 +195,165 @@ def node_call_propagacion(state: AgentState) -> AgentState:
         return {**state, "mcp_response": None, "error": error_msg}
 
 
+def node_call_semantico(state: AgentState) -> AgentState:
+    """Llama al MCP de búsqueda semántica usando ChromaDB."""
+    user_input = ""
+    for msg in reversed(state["messages"]):
+        if isinstance(msg, HumanMessage):
+            user_input = msg.content
+            break
+
+    try:
+        result = tool_semantico.invoke({"query": user_input, "n_results": 5})
+        return {**state, "mcp_response": result, "ultimo_analisis": result, "error": None}
+    except Exception as exc:
+        error_msg = str(exc)
+        if "500" in error_msg or "collection" in error_msg.lower():
+            error_msg = "La base de datos vectorial no tiene datos indexados. Ejecuta primero: python -m data.indexer"
+        return {**state, "mcp_response": None, "error": error_msg}
+
+
+def _get_user_input(state: AgentState) -> str:
+    """Extrae el último mensaje del usuario del estado."""
+    for msg in reversed(state["messages"]):
+        if isinstance(msg, HumanMessage):
+            return msg.content
+    return ""
+
+
 def node_respond(state: AgentState) -> AgentState:
-    """Genera una respuesta conversacional usando Gemini + los datos del MCP."""
+    """Genera una respuesta usando RAG: recupera fragmentos relevantes y Gemini los sintetiza."""
     llm = _build_llm(temperature=0.7)
     intencion = state.get("intencion", "otro")
     error = state.get("error")
     mcp_response = state.get("mcp_response")
     historial = _history_str(state["messages"])
+    user_input = _get_user_input(state)
 
     # --- Error path ---
     if error:
         response = llm.invoke([
-            SystemMessage(content=f"Eres Attina, asistente de análisis de conversaciones. Informa al usuario de este problema de forma amigable: {error}. Sugiere cómo solucionarlo si es posible."),
+            SystemMessage(content=(
+                f"Eres Attina, asistente de análisis de conversaciones. "
+                f"Informa al usuario de este problema de forma amigable: {error}. "
+                f"Sugiere cómo solucionarlo si es posible."
+            )),
             HumanMessage(content="Informa del error"),
         ])
         return {**state, "messages": [AIMessage(content=response.content)]}
 
-    # --- Fallback / otro ---
+    # --- Fallback / otro: RAG sobre pregunta abierta ---
     if intencion == "otro" or mcp_response is None:
-        response = llm.invoke([
-            SystemMessage(content=RESPOND_FALLBACK_PROMPT.format(historial=historial)),
-            HumanMessage(content="Responde al usuario"),
-        ])
-        return {**state, "messages": [AIMessage(content=response.content)]}
-
-    # --- Follow-up (usa datos del último análisis, no llama MCP) ---
-    if intencion == "seguimiento":
-        ultimo = state.get("ultimo_analisis")
-        if not ultimo:
+        fragments = _rag_retrieve(user_input)
+        if fragments:
+            context = build_context_string(fragments)
             response = llm.invoke([
-                SystemMessage(content="Eres Attina. No hay análisis previo disponible. Pide al usuario que realice primero un análisis (resumen, geográfico o propagación)."),
-                HumanMessage(content="Responde"),
-            ])
-        else:
-            user_input = ""
-            for msg in reversed(state["messages"]):
-                if isinstance(msg, HumanMessage):
-                    user_input = msg.content
-                    break
-            response = llm.invoke([
-                SystemMessage(content=FOLLOWUP_SYSTEM_PROMPT.format(
-                    tipo_analisis=state.get("intencion", "previo"),
-                    datos_mcp=json.dumps(ultimo, ensure_ascii=False, indent=2),
+                SystemMessage(content=RAG_SYSTEM_PROMPT.format(
+                    user_input=user_input,
+                    context=context,
                     historial=historial,
                 )),
                 HumanMessage(content=user_input),
             ])
+        else:
+            response = llm.invoke([
+                SystemMessage(content=RESPOND_FALLBACK_PROMPT.format(historial=historial)),
+                HumanMessage(content="Responde al usuario"),
+            ])
         return {**state, "messages": [AIMessage(content=response.content)]}
 
-    # --- Normal MCP response ---
-    response = llm.invoke([
-        SystemMessage(content=RESPOND_SYSTEM_PROMPT.format(
+    # --- Follow-up: RAG enriquecido con el análisis previo ---
+    if intencion == "seguimiento":
+        ultimo = state.get("ultimo_analisis")
+        fragments = _rag_retrieve(user_input)
+        context = build_context_string(fragments) if fragments else "(Sin fragmentos adicionales)"
+
+        if not ultimo and not fragments:
+            response = llm.invoke([
+                SystemMessage(content=(
+                    "Eres Attina. No hay análisis previo ni contexto disponible. "
+                    "Pide al usuario que realice primero un análisis (resumen, geográfico, propagación o búsqueda semántica)."
+                )),
+                HumanMessage(content="Responde"),
+            ])
+        else:
+            datos_previos = json.dumps(ultimo, ensure_ascii=False, indent=2) if ultimo else "(Sin datos previos)"
+            combined_prompt = (
+                FOLLOWUP_SYSTEM_PROMPT.format(
+                    tipo_analisis=state.get("intencion", "previo"),
+                    datos_mcp=datos_previos,
+                    historial=historial,
+                )
+                + f"\n\nFRAGMENTOS ADICIONALES RECUPERADOS:\n{context}"
+            )
+            response = llm.invoke([
+                SystemMessage(content=combined_prompt),
+                HumanMessage(content=user_input),
+            ])
+        return {**state, "messages": [AIMessage(content=response.content)]}
+
+    # --- MCP response enriquecida con RAG ---
+    # La query RAG combina la pregunta del usuario con el resultado del MCP
+    # para recuperar fragmentos que complementen el análisis estructurado.
+    rag_query = f"{user_input} {_mcp_summary_for_rag(mcp_response, intencion)}"
+    fragments = _rag_retrieve(rag_query)
+    context = build_context_string(fragments) if fragments else "(Sin fragmentos adicionales)"
+
+    combined_prompt = (
+        RESPOND_SYSTEM_PROMPT.format(
             tipo_analisis=intencion,
             datos_mcp=json.dumps(mcp_response, ensure_ascii=False, indent=2),
             historial=historial,
-        )),
-        HumanMessage(content="Genera la respuesta para el usuario basándote en los datos del análisis."),
+        )
+        + f"\n\nFRAGMENTOS REALES RECUPERADOS PARA ENRIQUECER LA RESPUESTA:\n{context}"
+        + "\n\nCita ejemplos reales de los fragmentos al presentar los resultados del análisis."
+    )
+
+    response = llm.invoke([
+        SystemMessage(content=combined_prompt),
+        HumanMessage(content="Genera la respuesta para el usuario basándote en los datos del análisis y los fragmentos recuperados."),
     ])
 
     return {**state, "messages": [AIMessage(content=response.content)]}
+
+
+# ---------------------------------------------------------------------------
+# RAG helpers
+# ---------------------------------------------------------------------------
+
+def _rag_retrieve(query: str) -> list:
+    """Recupera fragmentos con manejo de errores. Retorna lista vacía si ChromaDB no está listo."""
+    if not query or not query.strip():
+        return []
+    try:
+        return retrieve(query, k_conversations=4, k_documents=3, min_score=0.25)
+    except Exception as exc:
+        logger.warning("RAG retrieve falló (ChromaDB no disponible): %s", exc)
+        return []
+
+
+def _mcp_summary_for_rag(mcp_response: Optional[dict], intencion: str) -> str:
+    """Extrae palabras clave del resultado MCP para enriquecer la query RAG."""
+    if not mcp_response:
+        return ""
+    try:
+        if intencion == "resumen":
+            tematica = mcp_response.get("tematica_principal", "")
+            keywords = " ".join(mcp_response.get("palabras_clave", [])[:5])
+            return f"{tematica} {keywords}"
+        elif intencion == "geografico":
+            paises = " ".join(
+                p.get("pais", "") for p in mcp_response.get("paises_mas_activos", [])[:3]
+            )
+            return paises
+        elif intencion == "propagacion":
+            return mcp_response.get("mensaje_original", "")[:200]
+        elif intencion == "semantico":
+            results = mcp_response.get("results", [])
+            return " ".join(r.get("text", "")[:50] for r in results[:3])
+    except Exception:
+        pass
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +366,7 @@ def route_by_intent(state: AgentState) -> str:
         "resumen": "call_resumen",
         "geografico": "call_geografico",
         "propagacion": "call_propagacion",
+        "semantico": "call_semantico",
         "seguimiento": "respond",
         "otro": "respond",
     }
@@ -278,6 +384,7 @@ def build_graph() -> StateGraph:
     graph.add_node("call_resumen", node_call_resumen)
     graph.add_node("call_geografico", node_call_geografico)
     graph.add_node("call_propagacion", node_call_propagacion)
+    graph.add_node("call_semantico", node_call_semantico)
     graph.add_node("respond", node_respond)
 
     graph.set_entry_point("router")
@@ -289,6 +396,7 @@ def build_graph() -> StateGraph:
             "call_resumen": "call_resumen",
             "call_geografico": "call_geografico",
             "call_propagacion": "call_propagacion",
+            "call_semantico": "call_semantico",
             "respond": "respond",
         },
     )
@@ -296,6 +404,7 @@ def build_graph() -> StateGraph:
     graph.add_edge("call_resumen", "respond")
     graph.add_edge("call_geografico", "respond")
     graph.add_edge("call_propagacion", "respond")
+    graph.add_edge("call_semantico", "respond")
     graph.add_edge("respond", END)
 
     return graph.compile()
