@@ -3,7 +3,6 @@ from pydantic import BaseModel, Field
 from typing import Optional
 from collections import Counter
 from . import config
-from data.loader import get_loader
 
 router = APIRouter(prefix="/analisis", tags=["geografico"])
 
@@ -58,11 +57,7 @@ async def analisis_geografico(request: GeograficoRequest):
     conversations = request.conversaciones
 
     if not conversations:
-        try:
-            loader = get_loader()
-            conversations = loader.load_raw_json(config.SAMPLE_DATASET)
-        except FileNotFoundError:
-            raise HTTPException(status_code=400, detail="No se proporcionaron conversaciones y no se encontró dataset")
+        conversations = config.load_dataset_as_dicts()
 
     cardinal_counts: dict[str, int] = {}
     country_counts: Counter = Counter()

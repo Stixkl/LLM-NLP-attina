@@ -3,7 +3,6 @@ from pydantic import BaseModel, Field
 from typing import Optional
 from langchain_google_genai import ChatGoogleGenerativeAI
 from . import config
-from data.loader import get_loader
 
 router = APIRouter(prefix="/analisis", tags=["resumen"])
 
@@ -38,12 +37,7 @@ async def analisis_resumen(request: ResumenRequest):
     conversations = request.conversations
 
     if not conversations:
-        try:
-            loader = get_loader()
-            raw_data = loader.load_raw_json(config.SAMPLE_DATASET)
-            conversations = raw_data
-        except FileNotFoundError:
-            raise HTTPException(status_code=400, detail="No se proporcionaron conversaciones y no se encontró dataset")
+        conversations = config.load_dataset_as_dicts()
 
     num_conversaciones = len(conversations)
 
