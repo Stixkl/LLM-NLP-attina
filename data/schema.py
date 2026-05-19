@@ -1,8 +1,81 @@
 from dataclasses import dataclass, field
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 
+import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# Helpers de conversión robustos
+# ---------------------------------------------------------------------------
+
+def _parse_datetime(value) -> datetime:
+    """Convierte createdAt a datetime manejando múltiples formatos:
+    - Unix ms (int/float/string numérico): 1750834500000
+    - pandas Timestamp / numpy datetime64
+    - String ISO 8601
+    """
+    if value is None:
+        return datetime.now(tz=timezone.utc)
+    if hasattr(value, "to_pydatetime"):
+        result = value.to_pydatetime()
+        return result.replace(tzinfo=timezone.utc) if result.tzinfo is None else result
+    try:
+        if pd.isna(value):
+            return datetime.now(tz=timezone.utc)
+    except (TypeError, ValueError):
+        pass
+    try:
+        ms = int(float(str(value)))
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    except (ValueError, OSError, OverflowError):
+        pass
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+    return datetime.now(tz=timezone.utc)
+
+
+def _safe_float(value, default=None) -> Optional[float]:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_int(value, default: int = 0) -> int:
+    if value is None:
+        return default
+    try:
+        return int(float(value))
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in ("true", "1", "yes")
+
+
+def _split_list(val) -> list:
+    if not val:
+        return []
+    return [s.strip() for s in str(val).split(",") if s.strip()]
+
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
 
 class MessageType(str, Enum):
     POST = "post"
@@ -19,6 +92,10 @@ class SocialSource(str, Enum):
     REDDIT = "reddit"
     OTHER = "other"
 
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Author:
@@ -65,8 +142,8 @@ class Message:
     is_liked: bool = False
     engagement_rate: Optional[float] = None
 
-    tags: list[str] = field(default_factory=list)
-    keywords: list[str] = field(default_factory=list)
+    tags: list = field(default_factory=list)
+    keywords: list = field(default_factory=list)
 
     has_media: bool = False
     is_ad: bool = False
@@ -81,28 +158,28 @@ class Message:
             username=author_data or data.get("author", data.get("authorId", "")),
             url=data.get("authorURL"),
             category=data.get("authorCategory"),
-            is_bot=data.get("isBot", "false").lower() == "true" if data.get("isBot") else False,
-            influence_score=float(data["influenceScore"]) if data.get("influenceScore") else None,
+            is_bot=_safe_bool(data.get("isBot")),
+            influence_score=_safe_float(data.get("influenceScore")),
         )
 
         location = None
         if data.get("latitude") or data.get("longitude"):
             location = Location(
                 country=data.get("country"),
-                latitude=float(data["latitude"]) if data.get("latitude") else None,
-                longitude=float(data["longitude"]) if data.get("longitude") else None,
+                latitude=_safe_float(data.get("latitude")),
+                longitude=_safe_float(data.get("longitude")),
             )
 
         message_type = MessageType.POST
-        if data.get("isRetweet", "").lower() == "true":
+        if _safe_bool(data.get("isRetweet")):
             message_type = MessageType.RETWEET
-        elif data.get("isComment", "").lower() == "true":
+        elif _safe_bool(data.get("isComment")):
             message_type = MessageType.COMMENT
 
         source = SocialSource.OTHER
         if data.get("sourceName"):
-            source_name = data["sourceName"].lower()
-            if "twitter" in source_name or "x" in source_name:
+            source_name = str(data["sourceName"]).lower()
+            if "twitter" in source_name or source_name == "x":
                 source = SocialSource.TWITTER
             elif "facebook" in source_name:
                 source = SocialSource.FACEBOOK
@@ -114,24 +191,24 @@ class Message:
                 source = SocialSource.REDDIT
 
         return cls(
-            id=data["id"],
+            id=str(data["id"]),
             text=data.get("text", "") or data.get("caption", "") or "",
             author=author,
-            created_at=datetime.fromisoformat(data["createdAt"].replace("Z", "+00:00")) if data.get("createdAt") else datetime.now(),
+            created_at=_parse_datetime(data.get("createdAt")),
             message_type=message_type,
             source=source,
             parent_id=data.get("parentId") or None,
             thread_id=data.get("threadId") or None,
             location=location,
             language=data.get("language"),
-            sentiment=float(data["sentiment"]) if data.get("sentiment") else None,
-            likes=int(data["liked"]) if data.get("liked") else 0,
-            is_liked=data.get("liked", "").lower() == "true" if data.get("liked") else False,
-            engagement_rate=float(data["engagementRate"]) if data.get("engagementRate") else None,
-            tags=data.get("tags", "").split(",") if data.get("tags") else [],
-            keywords=data.get("keywords", "").split(",") if data.get("keywords") else [],
-            has_media=data.get("hasImageOrVideo", "").lower() == "true" if data.get("hasImageOrVideo") else False,
-            is_ad=data.get("isAdvertisement", "").lower() == "true" if data.get("isAdvertisement") else False,
-            is_deleted=data.get("isDeleted", "").lower() == "true" if data.get("isDeleted") else False,
-            is_archived=data.get("isArchived", "").lower() == "true" if data.get("isArchived") else False,
+            sentiment=_safe_float(data.get("sentiment")),
+            likes=_safe_int(data.get("liked")),
+            is_liked=_safe_bool(data.get("liked")),
+            engagement_rate=_safe_float(data.get("engagementRate")),
+            tags=_split_list(data.get("tags")),
+            keywords=_split_list(data.get("keywords")),
+            has_media=_safe_bool(data.get("hasImageOrVideo")),
+            is_ad=_safe_bool(data.get("isAdvertisement")),
+            is_deleted=_safe_bool(data.get("isDeleted")),
+            is_archived=_safe_bool(data.get("isArchived")),
         )
